@@ -64,7 +64,7 @@ def lr_wd_annealing(sche_type: str, optimizer, peak_lr, wd, wd_end, cur_it, wp_i
     return min_lr, max_lr, min_wd, max_wd
 
 
-def filter_params(model, ndim_dict, nowd_keys=(), lr_scale=0.0) -> Tuple[
+def filter_params(model, ndim_dict, nowd_keys=(), lr_scale=0.0, meta_opt="adamw", default_opt="adamw") -> Tuple[
     List[str], List[torch.nn.Parameter], List[Dict[str, Union[torch.nn.Parameter, float]]]
 ]:
     with_lr_scale = hasattr(model, 'get_layer_id_and_scale_exp') and 0 < lr_scale <= 1
@@ -87,6 +87,8 @@ def filter_params(model, ndim_dict, nowd_keys=(), lr_scale=0.0) -> Tuple[
             cur_wd_sc, group_name = 0., 'ND'
         # elif any(k in name for k in small_wd_keys):
         #     cur_wd_sc, group_name = small_wd, 'small_decay'
+        elif name == "head.weight":   # manually identify the head (unembedding)
+            cur_wd_sc, group_name = 0., 'unembed'
         else:
             cur_wd_sc, group_name = 1., 'D'
         
@@ -98,10 +100,17 @@ def filter_params(model, ndim_dict, nowd_keys=(), lr_scale=0.0) -> Tuple[
         else:
             cur_lr_sc = 1.
             dbg = f'[no scale]'
+
+        if name == "head.weight":
+            cur_lr_sc = 1 / math.sqrt(para.shape[1])
+            dbg = f'[unembed scale {cur_lr_sc:.4f}]'
         
         if group_name not in para_groups:
             para_groups[group_name] = {'params': [], 'wd_sc': cur_wd_sc, 'lr_sc': cur_lr_sc}
             para_groups_dbg[group_name] = {'params': [], 'wd_sc': cur_wd_sc, 'lr_sc': dbg}
+            if meta_opt in ['dion', 'muon']:
+                para_groups[group_name]['algorithm'] = meta_opt if group_name == 'D' else default_opt
+                para_groups_dbg[group_name]['algorithm'] = meta_opt if group_name == 'D' else default_opt
         para_groups[group_name]['params'].append(para)
         para_groups_dbg[group_name]['params'].append(name)
     

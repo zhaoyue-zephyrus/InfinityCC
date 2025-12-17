@@ -13,11 +13,16 @@ from distutils.util import strtobool
 from typing import List, Optional, Tuple
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+from dion import Dion, Muon
 import numpy as np
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 from torch.nn import functional as F
 from torch.profiler import record_function
 from torch.utils.data import DataLoader
+import torchvision
+import torchvision.transforms.v2 as tv2
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 import torch.distributed as tdist
 
@@ -65,6 +70,8 @@ def build_everything_from_args(args: arg_util.Args, saver):
     
     # auto resume from broken experiment
     auto_resume_info, start_ep, start_it, acc_str, eval_milestone, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
+    for line in auto_resume_info:
+        print(line)
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
     args.dump_log()
@@ -88,7 +95,7 @@ def build_everything_from_args(args: arg_util.Args, saver):
 
 def build_model_optimizer(args, vae_ckpt):
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed._composable.fsdp import fully_shard
     from infinity.models.infinity import Infinity, MultipleLayers
     from infinity.models.init_param import init_weights
     from infinity.utils.amp_opt import AmpOptimizer
@@ -154,60 +161,63 @@ def build_model_optimizer(args, vae_ckpt):
 
     gpt_ddp_ema = None
     if args.zero:
-        from torch.distributed.fsdp import ShardingStrategy
-        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
         from torch.distributed.device_mesh import init_device_mesh
 
-        # use mix prec: https://github.com/pytorch/pytorch/issues/76607
-        if gpt_wo_ddp.num_block_chunks == 1:  # no chunks
-            auto_wrap_policy = ModuleWrapPolicy([type(gpt_wo_ddp.unregistered_blocks[0]), ])
-        else:
-            auto_wrap_policy = ModuleWrapPolicy([MultipleLayers, ])
-        
+        # Move model to device first
+        gpt_wo_ddp = gpt_wo_ddp.to(args.device)
+
+        # Initialize device mesh for FSDP2
         if args.enable_hybrid_shard:
-            sharding_strategy = ShardingStrategy.HYBRID_SHARD if args.zero == 3 else ShardingStrategy._HYBRID_SHARD_ZERO2
             world_size = dist.get_world_size()
             assert world_size % args.inner_shard_degree == 0
             assert args.inner_shard_degree > 1 and args.inner_shard_degree < world_size
-            device_mesh = init_device_mesh('cuda', (world_size // args.inner_shard_degree, args.inner_shard_degree))
+            device_mesh = init_device_mesh('cuda', (world_size // args.inner_shard_degree, args.inner_shard_degree), mesh_dim_names=('replicate', 'shard'))
+            replicate_mesh = device_mesh['replicate']
         else:
-            sharding_strategy = ShardingStrategy.FULL_SHARD if args.zero == 3 else ShardingStrategy.SHARD_GRAD_OP
-            device_mesh = None
-        print(f'{">" * 45 + " " * 5} FSDP INIT with {args.zero=} {sharding_strategy=} {auto_wrap_policy=} {" " * 5 + "<" * 45}', flush=True)
-        
-        gpt_ddp: FSDP = FSDP(
-            gpt_wo_ddp, 
-            device_id=dist.get_local_rank(),
-            sharding_strategy=sharding_strategy, 
-            mixed_precision=None,
-            auto_wrap_policy=auto_wrap_policy, 
-            use_orig_params=True, 
-            sync_module_states=True, 
-            limit_all_gathers=True,
-            device_mesh=device_mesh,
-        ).to(args.device)
-        
+            device_mesh = init_device_mesh('cuda', (dist.get_world_size(),), mesh_dim_names=('replicate',))
+            replicate_mesh = device_mesh['replicate']
+
+        print(f'{">" * 45 + " " * 5} FSDP2 INIT with {args.zero=} {device_mesh=} {" " * 5 + "<" * 45}', flush=True)
+
+        # Apply fully_shard to each transformer block
+        # Note: We manually apply to blocks to respect the wrapping structure
+        if gpt_wo_ddp.num_block_chunks == 1:  # no chunks
+            # Apply fully_shard to each individual block
+            for block in gpt_wo_ddp.unregistered_blocks:
+                fully_shard(block, mesh=replicate_mesh)
+        else:
+            # Apply fully_shard to each chunk (MultipleLayers in block_chunks ModuleList)
+            for chunk in gpt_wo_ddp.block_chunks:
+                fully_shard(chunk, mesh=replicate_mesh)
+
+        # Apply to root module
+        fully_shard(gpt_wo_ddp, mesh=replicate_mesh)
+        gpt_ddp = gpt_wo_ddp
+
         if args.use_fsdp_model_ema:
             gpt_wo_ddp_ema = gpt_wo_ddp_ema.to(args.device)
-            gpt_ddp_ema: FSDP = FSDP(
-                gpt_wo_ddp_ema, 
-                device_id=dist.get_local_rank(),
-                sharding_strategy=sharding_strategy, 
-                mixed_precision=None,
-                auto_wrap_policy=auto_wrap_policy, 
-                use_orig_params=args.fsdp_orig, 
-                sync_module_states=True, 
-                limit_all_gathers=True,
-            )
+
+            # Apply same sharding to EMA model
+            if gpt_wo_ddp_ema.num_block_chunks == 1:
+                for block in gpt_wo_ddp_ema.unregistered_blocks:
+                    fully_shard(block, mesh=replicate_mesh)
+            else:
+                for chunk in gpt_wo_ddp_ema.block_chunks:
+                    fully_shard(chunk, mesh=replicate_mesh)
+
+            fully_shard(gpt_wo_ddp_ema, mesh=replicate_mesh)
+            gpt_ddp_ema = gpt_wo_ddp_ema
     else:
         ddp_class = DDP if dist.initialized() else misc.NullDDP
         gpt_ddp: DDP = ddp_class(gpt_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=args.dbg, broadcast_buffers=False)
+        replicate_mesh = None  # No FSDP, so no mesh
     torch.cuda.synchronize()
-
+    print("[check] sharding ok")
     # =============== build optimizer ===============
     nowd_keys = set()
     if args.nowd >= 1:
         nowd_keys |= {
+            'class_emb', 'word_embed',
             'cls_token', 'start_token', 'task_token', 'cfg_uncond',
             'pos_embed', 'pos_1LC', 'pos_start', 'start_pos', 'lvl_embed',
             'gamma', 'beta',
@@ -217,7 +227,7 @@ def build_model_optimizer(args, vae_ckpt):
         }
     if args.nowd >= 2:
         nowd_keys |= {'class_emb', 'embedding'}
-    names, paras, para_groups = filter_params(gpt_ddp if args.zero else gpt_wo_ddp, ndim_dict, nowd_keys=nowd_keys)
+    names, paras, para_groups = filter_params(gpt_ddp if args.zero else gpt_wo_ddp, ndim_dict, nowd_keys=nowd_keys, meta_opt=args.opt, default_opt=args.opt1d)
     del ndim_dict
     if '_' in args.ada:
         beta0, beta1 = map(float, args.ada.split('_'))
@@ -228,9 +238,28 @@ def build_model_optimizer(args, vae_ckpt):
         'sgd':   partial(torch.optim.SGD, momentum=beta0, nesterov=True),
         'adam':  partial(torch.optim.AdamW, betas=(beta0, beta1), fused=args.afuse),
         'adamw': partial(torch.optim.AdamW, betas=(beta0, beta1), fused=args.afuse),
+        'dion':  Dion,
+        'muon':  Muon,
     }[args.opt]
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     if args.oeps: opt_kw['eps'] = args.oeps
+    if args.wd: opt_kw['weight_decay'] = args.wd
+
+    # For Dion/Muon with FSDP2, pass the mesh configuration
+    # FSDP2 creates DTensor parameters, which Dion requires
+    if args.opt in ['dion', 'muon'] and args.zero:
+        if args.enable_hybrid_shard:
+            # For hybrid sharding:
+            # - replicate_mesh: data parallel dimension for gradient sync
+            # - outer_shard_mesh: FSDP sharding dimension
+            opt_kw['replicate_mesh'] = device_mesh['replicate']
+            opt_kw['outer_shard_mesh'] = device_mesh['shard']
+        else:
+            # For non-hybrid FSDP: single dimension is outer_shard_mesh
+            # Set replicate_mesh_grad_sync=False since FSDP handles gradient sync
+            opt_kw['outer_shard_mesh'] = replicate_mesh
+            opt_kw['replicate_mesh_grad_sync'] = False
+
     print(f'[vgpt] optim={opt_clz}, opt_kw={opt_kw}\n')
     gpt_optim = AmpOptimizer('gpt', args.fp16, opt_clz(params=para_groups, **opt_kw), gpt_ddp if args.zero else gpt_wo_ddp, args.r_accu, args.tclip, args.zero)
     del names, paras, para_groups
@@ -247,6 +276,7 @@ def build_model_optimizer(args, vae_ckpt):
     else:
         text_tokenizer = text_encoder = None
     
+    print("[check] model and optimizer built")
     return text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim
 
 
@@ -261,12 +291,40 @@ def build_dataloaders(args):
             load_vae_instead_of_image=False
         )
     else:
-        raise NotImplementedError(f'args.task_type={args.task_type} not supported')
+        dataset_train = torchvision.datasets.ImageFolder(
+            args.data_path,
+            transform=tv2.Compose([
+                tv2.Resize(args.crop_resolution, interpolation=tv2.InterpolationMode.LANCZOS),
+                tv2.RandomCrop(256),
+                tv2.ToImage(),
+                tv2.ToDtype(torch.float32, scale=True),
+                tv2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+        )
+        dataset_train.total_samples = lambda: len(dataset_train)
+        dataset_train.h_div_w_template2generator = {
+            1.0: {
+                'filepath': args.data_path,
+                'num_of_samples': len(dataset_train),
+                'num_of_batches': max(1, int((len(dataset_train) // (args.workers * tdist.get_world_size()) // args.batch_size))),
+            }
+        }
     type_train_set = type(dataset_train).__name__
     vbs = round(args.batch_size * 1.5)
     print(f"{args.batch_size=}, {vbs=}", flush=True)
     ld_val = math.ceil(50000 / vbs)
-    ld_train = DataLoader(dataset=dataset_train, num_workers=args.workers, pin_memory=True, generator=args.get_different_generator_for_each_rank(), batch_size=None, prefetch_factor=args.prefetch_factor)
+    ld_train = DataLoader(
+        dataset=dataset_train,
+        num_workers=args.workers,
+        shuffle=False if args.task_type == 't2i' else None,
+        sampler=None if args.task_type == 't2i' else torch.utils.data.distributed.DistributedSampler(dataset_train, shuffle=args.shuffle),
+        pin_memory=True,
+        generator=args.get_different_generator_for_each_rank(),
+        batch_size=None if args.task_type == 't2i' else args.batch_size,
+        prefetch_factor=args.prefetch_factor,
+        drop_last=True,
+        persistent_workers=(args.workers > 0),
+    )
     iters_train = len(ld_train)
     print(f'len(dataloader): {len(ld_train)}, len(dataset): {len(dataset_train)}, total_samples: {dataset_train.total_samples()}')
     print(f'[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, type(train_set)={type_train_set}')
@@ -275,7 +333,15 @@ def build_dataloaders(args):
 
 def main_train(args: arg_util.Args):
     saver = CKPTSaver(dist.is_master(), eval_milestone=None)
+    # build wandb logger
+    if dist.is_master():
+        wandb_utils.wandb.init(
+            project=args.project_name,
+            name=args.exp_name,
+            config=args.as_dict(),
+        )
     ret = build_everything_from_args(args, saver)
+    print("[check] build everything ok")
     
     if ret is None:
         return
@@ -322,17 +388,18 @@ def main_train(args: arg_util.Args):
     ep_lg = max(1, args.ep // 10) if args.ep <= 100 else max(1, args.ep // 20)
     
     # ============================================= epoch loop begins =============================================
+    print(f'[PT] Starting AR training from ep{start_ep} it{start_it} ...\n\n')
     L_mean, L_tail = -1, -1
     epochs_loss_nan = 0
-    # build wandb logger
-    if dist.is_master():
-        wandb_utils.wandb.init(project=args.project_name, name=args.exp_name, config={})
+
     for ep in range(start_ep, args.ep):
         if ep % ep_lg == 0 or ep == start_ep:
             print(f'[PT info]  from ep{start_ep} it{start_it}, acc_str: {acc_str}, diffs: {args.diffs},    =======>  bed: {args.bed}  <=======\n')
         # set epoch for dataloader
         if args.use_streaming_dataset:
             ld_train.dataset.set_epoch(ep)
+        else:
+            ld_train.sampler.set_epoch(ep)
 
         # [train one epoch]
         stats, (sec, remain_time, finish_time) = train_one_ep(
@@ -476,27 +543,32 @@ def train_one_ep(
                 if enable_timeline_sdk:
                     ndtimeline.flush()
             
-            if (g_it+1) % args.save_model_iters_freq == 0:
+            if (g_it+1) % args.save_model_iters_freq == 0 or (g_it + 1 == max_it):
                 with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=3, verbose=True):
                     saver.sav(args=args, g_it=(g_it+1), next_ep=ep, next_it=it+1, trainer=trainer, acc_str=f'[todo]', eval_milestone=None, also_save_to=None, best_save_to=None)
             
             with maybe_record_function('before_train'):
                 # [get data]
-                inp, captions = data
-                tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
-                input_ids = tokens.input_ids.cuda(non_blocking=True)
-                mask = tokens.attention_mask.cuda(non_blocking=True)
-                text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-                
-                lens: List[int] = mask.sum(dim=-1).tolist()
-                cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-                Ltext = max(lens)
-                
-                kv_compact = []
-                for len_i, feat_i in zip(lens, text_features.unbind(0)):
-                    kv_compact.append(feat_i[:len_i])
-                kv_compact = torch.cat(kv_compact, dim=0)
-                text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
+                if args.task_type == 't2i':
+                    inp, captions = data
+                    print(inp.shape, captions)
+                    tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
+                    input_ids = tokens.input_ids.cuda(non_blocking=True)
+                    mask = tokens.attention_mask.cuda(non_blocking=True)
+                    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
+                    
+                    lens: List[int] = mask.sum(dim=-1).tolist()
+                    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
+                    Ltext = max(lens)
+                    
+                    kv_compact = []
+                    for len_i, feat_i in zip(lens, text_features.unbind(0)):
+                        kv_compact.append(feat_i[:len_i])
+                    kv_compact = torch.cat(kv_compact, dim=0)
+                    text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
+                else:
+                    inp, class_label = data
+                    text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = class_label
                 inp = inp.to(args.device, non_blocking=True)
                 if it > start_it + 10:
                     telling_dont_kill.early_stop()

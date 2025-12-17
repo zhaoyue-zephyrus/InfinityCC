@@ -1,3 +1,46 @@
+# InfinityCC
+
+InfinityCC = Infinity with class condition.  
+This is a working example to showcase the power of [NPQ](https://ai.stanford.edu/~yzz/blog/articles/npq.html) on ImageNet-1k (class-conditioned generation).
+
+<img src="./assets/npq.png" width="640">
+
+[**Spherical Leech Quantization for Visual Tokenization and Generation**](http://arxiv.org/abs/2512.14697)  
+Yue Zhao<sup>1,2</sup>, Hanwen Jiang<sup>1,3</sup>, Zhenlin Xu<sup>4</sup>, Chutong Yang<sup>1</sup>, Ehsan Adeli<sup>2</sup>, Philipp Kr&auml;henb&uuml;hl<sup>1</sup>  
+<sup>1</sup>UT Austin, <sup>2</sup>Stanford University, <sup>3</sup>Adobe Research, <sup>4</sup>Mistral AI  
+[arxiv](http://arxiv.org/abs/2512.14697) | [bibtex](#citing-npq-vit) 
+
+## Installation
+
+We use [uv](https://docs.astral.sh/uv/) to manage all dependencies.
+
+```bash
+uv sync
+source .venv/bin/activate
+```
+
+To evaluate ImageNet using the ADM evaluator, run the following command lines:
+```bash
+mkdir third_party/ && cd third_party/
+git clone https://${GIT_TOKEN}@github.com/openai/guided-diffusion.git
+cd guided-diffusion/evaluations
+wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
+```
+
+## Results
+
+### Infinity
+|   model    |  Resolution |  #layers | Tokenizer (HF weights🤗) | VAR Model (HF weights🤗)  |   FID   |
+|:----------:|:-----:|:--------:|:---------:|:-----------------------------------------------------------------------------------:|:----:|
+| InfinityCC |     256     |    12    | [bitvae_l24_xl](https://huggingface.co/zhaoyue-zephyrus/InfinityCC_L24SQ/tree/main/tokenization/infinity_l24_stage1_xl)   | [infinitycc_12layer_weights](https://huggingface.co/zhaoyue-zephyrus/InfinityCC_L24SQ/tree/main/generation/infinitycc_12layer_256x256_l24_xl_ep50_cce_zloss_improved_schedule_dion) | 6.66 |
+| InfinityCC |     256     |    24    | [bitvae_l24_xl_vf](https://huggingface.co/zhaoyue-zephyrus/InfinityCC_L24SQ/tree/main/tokenization/infinity_l24_stage1_xl_vf)   | [infinitycc_24layer_weights](https://huggingface.co/zhaoyue-zephyrus/InfinityCC_L24SQ/tree/main/generation/infinitycc_24layer_256x256_l24_xl_vf_ep350_cce_zloss_improved_schedule_dion_unsharedaln) | 2.21 |
+| InfinityCC-2B |   256    |    32    | [TBD]()   | [TBD]() | 1.80 |
+
+## Training
+
+TBD
+
+
 # Infinity $\infty$: Scaling Bitwise AutoRegressive Modeling for High-Resolution Image Synthesis
 
 <div align="center">

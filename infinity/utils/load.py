@@ -22,9 +22,9 @@ from infinity.utils.misc import os_system
 def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash=False, device='cuda'):
     if args.vae_type in [8,16,18,20,24,32,64,128]:
         from infinity.models.bsq_vae.vae import vae_model
-        schedule_mode = "dynamic"
+        schedule_mode = args.schedule_mode
         codebook_dim = args.vae_type # 18
-        codebook_size = 2**codebook_dim
+        codebook_size = 2**codebook_dim if args.quantizer_type == "MultiScaleBSQ" else args.codebook_size
         if args.apply_spatial_patchify:
             patch_size = 8
             encoder_ch_mult=[1, 2, 4, 4]
@@ -33,8 +33,18 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
             patch_size = 16
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
-        vae_local = vae_model(vae_st, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
-                              encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(args.device)
+        vae_local = vae_model(
+            vae_st,
+            schedule_mode,
+            codebook_dim,
+            codebook_size,
+            patch_size=patch_size,
+            encoder_ch_mult=encoder_ch_mult,
+            decoder_ch_mult=decoder_ch_mult,
+            test_mode=True,
+            quantizer_type=args.quantizer_type,
+            leech_type=args.leech_type,
+        ).to(args.device)
         if args.fake_vae_input:
             vae_local.encoder = None
             vae_local.decoder = None
@@ -57,8 +67,11 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
         pad_to_multiplier=args.pad_to_multiplier,
         use_flex_attn=args.use_flex_attn,
         batch_size=args.batch_size,
+        schedule_mode=args.schedule_mode,
         add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
         use_bit_label=args.use_bit_label,
+        use_dit_label=args.use_dit_label,
+        use_cce=args.use_cce,
         rope2d_each_sa_layer=args.rope2d_each_sa_layer,
         rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
         pn=args.pn,

@@ -11,6 +11,8 @@ from torchvision import transforms
 from safetensors.torch import load_file
 import torch.utils.checkpoint as checkpoint
 
+from infinity.models.bsq_vae.multiscale_leechq import MultiScaleLeechQ
+
 from .conv import Conv
 from .multiscale_bsq import MultiScaleBSQ
 
@@ -475,6 +477,18 @@ class AutoEncoder(nn.Module):
                     drop_when_test = args.drop_when_test,
                     drop_lvl_idx = args.drop_lvl_idx,
                     drop_lvl_num = args.drop_lvl_num,
+                )
+                self.quantize = self.quantizer
+                self.vocab_size = args.codebook_size
+            elif args.quantizer_type == "MultiScaleLeechQ":
+                self.quantizer = MultiScaleLeechQ(
+                    codebook_size=args.codebook_size,
+                    dim=args.codebook_dim,
+                    use_stochastic_depth=args.use_stochastic_depth,
+                    drop_rate=args.drop_rate,
+                    schedule_mode=args.schedule_mode,
+                    keep_last_quant=args.keep_last_quant,
+                    leech_type=args.leech_type,
                 )
                 self.quantize = self.quantizer
                 self.vocab_size = args.codebook_size

@@ -134,10 +134,7 @@ class AmpOptimizer:
                 self.fp.write(f'<ep{ep} it{it} {g_it}>\n'); self.fp.flush()
             if self.early_clipping:
                 c = self.grad_clip * clip_decay_ratio
-                if self.zero:
-                    orig_norm: Optional[torch.Tensor] = self.model_maybe_fsdp.clip_grad_norm_(c)
-                else:
-                    orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), c)
+                orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), c)
             
             # if self.fp is not None: self.fp.write(f'[backward_clip_step:175] [it{it}, g_it{g_it}] before opt step\n'); self.fp.flush()
             if self.scaler is not None:

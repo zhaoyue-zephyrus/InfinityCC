@@ -552,7 +552,8 @@ class BSQ(Module):
         # indices to codes, which are bits of either -1 or 1
 
         if label_type == 'int_label':
-            assert indices[..., None].int().min() > 0
+            # import pdb; pdb.set_trace()
+            # assert indices[..., None].int().min() > 0
             bits = ((indices[..., None].int() & self.mask) != 0).float() # .to(self.dtype)
         else:
             bits = indices

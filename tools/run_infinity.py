@@ -128,6 +128,51 @@ def gen_one_img(
     img = img_list[0]
     return img
 
+
+def gen_imgs_class_conditioned(
+    infinity_test,
+    vae,
+    class_index,
+    cfg_list=[],
+    tau_list=[],
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,
+    vae_type=0,
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,
+    gt_ls_Bl=None,
+    g_seed=None,
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+):
+    sstt = time.time()
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+        stt = time.time()
+        _, _, img_list = infinity_test.autoregressive_infer_cfg(
+            vae=vae,
+            scale_schedule=scale_schedule,
+            label_B_or_BLT=class_index, g_seed=g_seed,
+            B=class_index.shape[0], negative_label_B_or_BLT=None, force_gt_Bhw=None,
+            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
+            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
+            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
+            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
+            ret_img=True, trunk_scale=1000,
+            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
+            sampling_per_bits=sampling_per_bits,
+        )
+    # print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
+    return img_list
+
 def get_prompt_id(prompt):
     md5 = hashlib.md5()
     md5.update(prompt.encode('utf-8'))
@@ -161,9 +206,12 @@ def load_infinity(
     rope2d_normalized_by_hw, 
     use_scale_schedule_embedding, 
     pn, 
-    use_bit_label, 
+    use_bit_label,
+    use_dit_label,
+    schedule_mode,
     add_lvl_embeding_only_first_block, 
     model_path='', 
+    saln=True,
     scale_schedule=None, 
     vae=None, 
     device='cuda', 
@@ -179,14 +227,16 @@ def load_infinity(
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
         infinity_test: Infinity = Infinity(
             vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-            shared_aln=True, raw_scale_schedule=scale_schedule,
+            shared_aln=saln, raw_scale_schedule=scale_schedule,
             checkpointing='full-block',
             customized_flash_attn=False,
-            fused_norm=True,
+            fused_norm=False, #True,
             pad_to_multiplier=128,
             use_flex_attn=use_flex_attn,
+            schedule_mode=schedule_mode,
             add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
             use_bit_label=use_bit_label,
+            use_dit_label=use_dit_label,
             rope2d_each_sa_layer=rope2d_each_sa_layer,
             rope2d_normalized_by_hw=rope2d_normalized_by_hw,
             pn=pn,
@@ -199,7 +249,12 @@ def load_infinity(
 
         if bf16:
             for block in infinity_test.unregistered_blocks:
-                block.bfloat16()
+                if not block.shared_aln:
+                    # Manually keep ada_lin in fp32
+                    block.attn.bfloat16()
+                    block.ffn.bfloat16()
+                else:
+                    block.bfloat16()
 
         infinity_test.eval()
         infinity_test.requires_grad_(False)
@@ -209,7 +264,9 @@ def load_infinity(
 
         print(f'[Load Infinity weights]')
         if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
+            state_dict = torch.load(model_path, weights_only=False, map_location=device)
+            if "trainer" in state_dict:
+                state_dict = state_dict["trainer"]["gpt_fsdp"]
             print(infinity_test.load_state_dict(state_dict))
         elif checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint
@@ -259,9 +316,9 @@ def load_visual_tokenizer(args):
     # load vae
     if args.vae_type in [14,16,18,20,24,32,64]:
         from infinity.models.bsq_vae.vae import vae_model
-        schedule_mode = "dynamic"
+        schedule_mode = args.schedule_mode
         codebook_dim = args.vae_type
-        codebook_size = 2**codebook_dim
+        codebook_size = 2**codebook_dim if args.quantizer_type == "MultiScaleBSQ" else args.codebook_size
         if args.apply_spatial_patchify:
             patch_size = 8
             encoder_ch_mult=[1, 2, 4, 4]
@@ -271,7 +328,8 @@ def load_visual_tokenizer(args):
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
         vae = vae_model(args.vae_path, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
-                        encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(device)
+                        encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True,
+                        quantizer_type=args.quantizer_type, leech_type=args.leech_type).to(device)
     else:
         raise ValueError(f'vae_type={args.vae_type} not supported')
     return vae
@@ -334,8 +392,11 @@ def load_transformer(vae, args):
         use_scale_schedule_embedding=args.use_scale_schedule_embedding,
         pn=args.pn,
         use_bit_label=args.use_bit_label, 
+        use_dit_label=args.use_dit_label,
+        schedule_mode=args.schedule_mode,
         add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block, 
         model_path=slim_model_path, 
+        saln=args.saln,
         scale_schedule=None, 
         vae=vae, 
         device=device, 
@@ -351,13 +412,21 @@ def load_transformer(vae, args):
 def add_common_arguments(parser):
     parser.add_argument('--cfg', type=str, default='3')
     parser.add_argument('--tau', type=float, default=1)
+    parser.add_argument('--top_p', type=str, default='0.95')
+    parser.add_argument('--top_k', type=str, default='900')
     parser.add_argument('--pn', type=str, required=True, choices=['0.06M', '0.25M', '1M'])
     parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--saln', type=int, default=1, choices=[0,1])
     parser.add_argument('--cfg_insertion_layer', type=int, default=0)
     parser.add_argument('--vae_type', type=int, default=1)
+    parser.add_argument('--quantizer_type', type=str, default='MultiScaleBSQ', choices=['MultiScaleBSQ', 'MultiScaleLeechQ'])
+    parser.add_argument('--codebook_size', type=int, default=196_560)
+    parser.add_argument('--leech_type', type=str, default='full', choices=['full', '2', '3', '4'])
     parser.add_argument('--vae_path', type=str, default='')
+    parser.add_argument('--schedule_mode', type=str, default='dynamic', choices=['dynamic', 'original'])
     parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=0, choices=[0,1])
     parser.add_argument('--use_bit_label', type=int, default=1, choices=[0,1])
+    parser.add_argument('--use_dit_label', type=int, default=0, choices=[0,1])
     parser.add_argument('--model_type', type=str, default='infinity_2b')
     parser.add_argument('--rope2d_each_sa_layer', type=int, default=1, choices=[0,1])
     parser.add_argument('--rope2d_normalized_by_hw', type=int, default=2, choices=[0,1,2])
@@ -389,6 +458,15 @@ if __name__ == '__main__':
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
     
+    # parse top_k and top_p like cfg - can be single value or comma-separated list
+    args.top_k = list(map(int, args.top_k.split(',')))
+    if len(args.top_k) == 1:
+        args.top_k = args.top_k[0]
+    
+    args.top_p = list(map(float, args.top_p.split(',')))
+    if len(args.top_p) == 1:
+        args.top_p = args.top_p[0]
+    
     # load text encoder
     text_tokenizer, text_encoder = load_tokenizer(t5_path =args.text_encoder_ckpt)
     # load vae
@@ -416,6 +494,8 @@ if __name__ == '__main__':
                 cfg_insertion_layer=[args.cfg_insertion_layer],
                 vae_type=args.vae_type,
                 sampling_per_bits=args.sampling_per_bits,
+                top_k=args.top_k,  # Can be single value or list
+                top_p=args.top_p,  # Can be single value or list
                 enable_positive_prompt=args.enable_positive_prompt,
             )
     os.makedirs(osp.dirname(osp.abspath(args.save_file)), exist_ok=True)

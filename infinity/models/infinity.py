@@ -92,8 +92,11 @@ class Infinity(nn.Module):
         pad_to_multiplier=0,
         use_flex_attn=False,
         batch_size=2,
+        schedule_mode="dynamic",
         add_lvl_embeding_only_first_block=1,
         use_bit_label=1,
+        use_dit_label=0,
+        use_cce=0,
         rope2d_each_sa_layer=0,
         rope2d_normalized_by_hw=0,
         pn=None,
@@ -112,9 +115,17 @@ class Infinity(nn.Module):
         else:
             self.d_vae = vae_local.embed_dim
         self.use_bit_label = use_bit_label
+        self.use_dit_label = use_dit_label
+        self.use_cce = use_cce
+        assert self.use_bit_label + self.use_dit_label <= 1, f"{self.use_bit_label} + {self.use_dit_label} <= 1"
         self.codebook_dim = self.d_vae
-        self.V = (self.codebook_dim * 2) if self.use_bit_label else vae_local.vocab_size
-        self.bit_mask = vae_local.quantizer.lfq.mask if self.use_bit_label else None
+        if self.use_bit_label:
+            self.V = self.codebook_dim * 2
+        elif self.use_dit_label:
+            self.V = self.codebook_dim * 9
+        else:
+            self.V = vae_local.vocab_size
+        # self.bit_mask = vae_local.quantizer.lfq.mask if self.use_bit_label else None
         self.Ct5 = text_channels
         self.depth = depth
         self.num_heads = num_heads
@@ -128,6 +139,8 @@ class Infinity(nn.Module):
         self.video_frames = video_frames
         self.always_training_scales = always_training_scales
 
+        assert schedule_mode in ["dynamic", "original"], f'schedule_mode={schedule_mode} not supported'
+        self.schedule_mode = schedule_mode
         assert add_lvl_embeding_only_first_block in [0,1]
         self.add_lvl_embeding_only_first_block = add_lvl_embeding_only_first_block
         assert rope2d_each_sa_layer in [0,1]
@@ -215,7 +228,12 @@ class Infinity(nn.Module):
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         if self.rope2d_each_sa_layer:
-            rope2d_freqs_grid = precompute_rope2d_freqs_grid(dim=self.C//self.num_heads, dynamic_resolution_h_w=dynamic_resolution_h_w, pad_to_multiplier=self.pad_to_multiplier, rope2d_normalized_by_hw=self.rope2d_normalized_by_hw)
+            rope2d_freqs_grid = precompute_rope2d_freqs_grid(
+                dim=self.C//self.num_heads,
+                dynamic_resolution_h_w=dynamic_resolution_h_w,
+                pad_to_multiplier=self.pad_to_multiplier,
+                rope2d_normalized_by_hw=self.rope2d_normalized_by_hw,
+                pn="1M" if self.schedule_mode == "dynamic" else self.pn)
             self.rope2d_freqs_grid = rope2d_freqs_grid
         else:
             raise ValueError(f'self.rope2d_each_sa_layer={self.rope2d_each_sa_layer} not implemented')
@@ -338,6 +356,9 @@ class Infinity(nn.Module):
         :param tau: temperature
         :return: logits, shaped (B or batch_size, V or vocabulary_size)
         """
+        if self.use_cce:
+            with torch.amp.autocast('cuda', enabled=False):
+                return self.head_nm(h.float(), cond_BD.float())
         with torch.amp.autocast('cuda', enabled=False):
             return self.head(self.head_nm(h.float(), cond_BD.float()))
 
@@ -379,23 +400,29 @@ class Infinity(nn.Module):
 
         # [1. get input sequence x_BLC]
         with torch.amp.autocast('cuda', enabled=False):
-            kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
-            # drop cond
-            total = 0
-            for le in lens:
-                if random.random() < self.cond_drop_rate:
-                    kv_compact[total:total+le] = self.cfg_uncond[:le]
-                total += le
-            must_on_graph = self.cfg_uncond[0, 0] * 0
-            kv_compact = self.text_norm(kv_compact).contiguous()
-            sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32
-            kv_compact = self.text_proj_for_ca(kv_compact).contiguous()
-            kv_compact[0, 0] += must_on_graph
-            ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-            
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
-            
-            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+            if self.t2i:
+                kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+                # drop cond
+                total = 0
+                for le in lens:
+                    if random.random() < self.cond_drop_rate:
+                        kv_compact[total:total+le] = self.cfg_uncond[:le]
+                    total += le
+                must_on_graph = self.cfg_uncond[0, 0] * 0
+                kv_compact = self.text_norm(kv_compact).contiguous()
+                sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32
+                kv_compact = self.text_proj_for_ca(kv_compact).contiguous()
+                kv_compact[0, 0] += must_on_graph
+                ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+                cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
+                sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+            else:
+                ca_kv = None
+                # randomly drop cls cond to 0 (-1 + 1)
+                label_B_or_BLT = torch.where(torch.rand(label_B_or_BLT.shape[0], device=label_B_or_BLT.device) < self.cond_drop_rate, -1, label_B_or_BLT)
+                sos = cond_BD = self.class_emb(label_B_or_BLT + 1)
+                cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()
+                sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
             x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
 
             # [1.1. pad the seqlen dim]
@@ -473,6 +500,19 @@ class Infinity(nn.Module):
         else: self.rng.manual_seed(g_seed); rng = self.rng
         assert len(cfg_list) >= len(scale_schedule)
         assert len(tau_list) >= len(scale_schedule)
+        
+        # Handle top_k and top_p like cfg - can be single value or list
+        if not isinstance(top_k, list):
+            top_k_list = [top_k] * len(scale_schedule)
+        else:
+            assert len(top_k) >= len(scale_schedule), f"Need top_k for each scale: {len(scale_schedule)}"
+            top_k_list = top_k[:len(scale_schedule)]
+
+        if not isinstance(top_p, list):
+            top_p_list = [top_p] * len(scale_schedule)
+        else:
+            assert len(top_p) >= len(scale_schedule), f"Need top_p for each scale: {len(scale_schedule)}"
+            top_p_list = top_p[:len(scale_schedule)]
 
         # scale_schedule is used by infinity, vae_scale_schedule is used by vae if there exists a spatial patchify, 
         # we need to convert scale_schedule to vae_scale_schedule by multiply 2 to h and w
@@ -481,30 +521,42 @@ class Infinity(nn.Module):
         else:
             vae_scale_schedule = scale_schedule
         
-        kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
-        if any(np.array(cfg_list) != 1):
-            bs = 2*B
-            if not negative_label_B_or_BLT:
-                kv_compact_un = kv_compact.clone()
-                total = 0
-                for le in lens:
-                    kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
-                    total += le
-                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
-                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:]+cu_seqlens_k[-1]), dim=0)
+        if self.t2i:
+            kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+            if any(np.array(cfg_list) != 1):
+                bs = 2*B
+                if not negative_label_B_or_BLT:
+                    kv_compact_un = kv_compact.clone()
+                    total = 0
+                    for le in lens:
+                        kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
+                        total += le
+                    kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                    cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:]+cu_seqlens_k[-1]), dim=0)
+                else:
+                    kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
+                    kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                    cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:]+cu_seqlens_k[-1]), dim=0)
+                    max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
             else:
-                kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
-                kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
-                cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:]+cu_seqlens_k[-1]), dim=0)
-                max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
+                bs = B
+
+            kv_compact = self.text_norm(kv_compact)
+            sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
+            kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
+            ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+            last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
         else:
             bs = B
+            ca_kv = None
+            sos = cond_BD = self.class_emb(label_B_or_BLT + 1)
+            last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+            if any(np.array(cfg_list) != 1):
+                bs = 2*B
+                uncond_BD = self.class_emb(torch.zeros_like(label_B_or_BLT))
+                sos = cond_BD = torch.cat((sos, uncond_BD), dim=0)
+                last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
 
-        kv_compact = self.text_norm(kv_compact)
-        sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
-        kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
-        ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
@@ -572,29 +624,36 @@ class Infinity(nn.Module):
                 logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
             else:
                 logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+
+            # Use scale-specific sampling parameters
+            current_top_k = top_k_list[si] or self.top_k
+            current_top_p = top_p_list[si] or self.top_p
             
             if self.use_bit_label:
                 tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
                 logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
-                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=current_top_k, top_p=current_top_p, num_samples=1)[:, :, 0]
                 idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
             else:
-                idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=current_top_k, top_p=current_top_p, num_samples=1)[:, :, 0]
             if vae_type != 0:
                 assert returns_vemb
                 if si < gt_leak:
                     idx_Bld = gt_ls_Bl[si]
-                else:
-                    assert pn[0] == 1
-                    idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d]
-                    if self.apply_spatial_patchify: # unpatchify operation
-                        idx_Bld = idx_Bld.permute(0,3,1,2) # [B, 4d, h, w]
-                        idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2) # [B, d, 2h, 2w]
-                        idx_Bld = idx_Bld.permute(0,2,3,1) # [B, 2h, 2w, d]
-                    idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
+                assert pn[0] == 1
+                idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d]
+                if self.apply_spatial_patchify: # unpatchify operation
+                    idx_Bld = idx_Bld.permute(0,3,1,2) # [B, 4d, h, w]
+                    idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2) # [B, d, 2h, 2w]
+                    idx_Bld = idx_Bld.permute(0,2,3,1) # [B, 2h, 2w, d]
+                idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
 
                 idx_Bld_list.append(idx_Bld)
-                codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                if self.use_bit_label:
+                    codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                else:
+                    idx_Bld = idx_Bld.squeeze(-1)
+                    codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='int_label')
                 if si != num_stages_minus_1:
                     summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
                     last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]

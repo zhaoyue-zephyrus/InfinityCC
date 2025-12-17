@@ -1,0 +1,53 @@
+[project]
+name = "infinity"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12"
+dependencies = [
+    "colorama>=0.4.6",
+    # "decord>=0.6.0",
+    "easydict>=1.13",
+    "einops>=0.8.1",
+    "ninja==1.13.0",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
+    "gputil>=1.4.0",
+    "httpx==0.20.0",
+    "imageio>=2.37.0",
+    "kornia>=0.8.1",
+    "omegaconf>=2.3.0",
+    "openai>=0.28.1",
+    "opencv-python>=4.11.0.86",
+    "pandas>=2.2.3",
+    "pytz>=2025.2",
+    "seaborn>=0.13.2",
+    "timm==0.9.6",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers>=4.52.3",
+    "typed-argument-parser>=1.10.1",
+    "wandb>=0.19.11",
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git",
+    "dion @ git+https://github.com/microsoft/dion.git",
+    "tensorflow>=2.20.0",
+    "scipy>=1.16.3",
+    "requests>=2.32.5",
+    "tqdm>=4.67.1",
+    "pytorch-fid>=0.3.0",
+]
+
+[tool.uv.sources]
+torch = { index = "torch-cu128" }
+torchvision = { index = "torch-cu128" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch", "ninja"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

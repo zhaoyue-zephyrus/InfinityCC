@@ -44,6 +44,13 @@ for ratio in full_ratio2hws:
             'scales': scales
         }
 
+# 0.000 corresponds to dense schedule (used in VAR C2I)
+dynamic_resolution_h_w[0.000] = {
+    '0.06M': {'pixel': (256, 256), 'scales': [(1,1,1),(1,2,2),(1,3,3),(1,4,4),(1,5,5),(1,6,6),(1,8,8),(1,10,10),(1,13,13),(1,16,16)]},
+    '0.25M': {'pixel': (512, 512), 'scales': [(1,1,1),(1,2,2),(1,3,3),(1,4,4),(1,6,6),(1,9,9),(1,13,13),(1,18,18),(1,24,24),(1,32,32)]},
+    '1M': {'pixel': (1024, 1024), 'scales': [(1,1,1),(1,2,2),(1,3,3),(1,4,4),(1,5,5),(1,7,7),(1,9,9),(1,12,12),(1,16,16),(1,21,21),(1,27,27),(1,36,36),(1,48,48),(1,64,64)]},
+}
+
 h_div_w_templates = []
 for h_div_w in dynamic_resolution_h_w.keys():
     h_div_w_templates.append(h_div_w)

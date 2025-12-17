@@ -69,7 +69,18 @@ def load_cnn(model, state_dict, prefix, expand=False, use_linear=False):
     return model, state_dict, loaded_keys
 
 
-def vae_model(vqgan_ckpt, schedule_mode, codebook_dim, codebook_size, test_mode=True, patch_size=16, encoder_ch_mult=[1, 2, 4, 4, 4], decoder_ch_mult=[1, 2, 4, 4, 4],):
+def vae_model(
+        vqgan_ckpt,
+        schedule_mode,
+        codebook_dim,
+        codebook_size,
+        test_mode=True,
+        patch_size=16,
+        encoder_ch_mult=[1, 2, 4, 4, 4],
+        decoder_ch_mult=[1, 2, 4, 4, 4],
+        quantizer_type='MultiScaleBSQ',
+        leech_type="full",
+):
     args=argparse.Namespace(
         vqgan_ckpt=vqgan_ckpt,
         sd_ckpt=None,
@@ -102,7 +113,8 @@ def vae_model(vqgan_ckpt, schedule_mode, codebook_dim, codebook_size, test_mode=
         embedding_dim=256,
         codebook_dim=codebook_dim,
         num_quantizers=8,
-        quantizer_type='MultiScaleBSQ',
+        quantizer_type=quantizer_type,
+        leech_type=leech_type,
         use_vae=False,
         use_freq_enc=False,
         use_freq_dec=False,

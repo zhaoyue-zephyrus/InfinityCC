@@ -114,6 +114,8 @@ class Args(Tap):
     tclip: float = 2.                   # <=0 for not grad clip GPT; >100 for per-param clip (%= 100 automatically)
     cdec: bool = False                  # decay the grad clip thresholds of GPT and GPT's word embed
     opt: str = 'adamw'                  # lion: https://cloud.tencent.com/developer/article/2336657?areaId=106001 lr=5e-5（比Adam学习率低四倍）和wd=0.8（比Adam高八倍）；比如在小的 batch_size 时，Lion 的表现不如 AdamW
+    opt1d: str = 'adamw'                 # optimizer for 1d params like bias and layernorm (used when opt == 'dion' or 'muon')
+    wd: float = 0.                      # weight decay
     ada: str = ''                       # adam's beta0 and beta1 for VAE or GPT, '0_0.99' from style-swin and magvit, '0.5_0.9' from VQGAN
     dada: str = ''                      # adam's beta0 and beta1 for discriminator
     oeps: float = 0                     # adam's eps, pixart uses 1e-10
@@ -124,6 +126,8 @@ class Args(Tap):
     patch_size: int = None              # [automatically set; don't specify this] = 2 ** (len(args.scale_schedule) - 1)
     resos: tuple = None                 # [automatically set; don't specify this]
     data_load_reso: int = None          # [automatically set; don't specify this]
+    crop_resolution: int = 256          # crop resolution during training
+    shuffle: bool = True                # whether to shuffle the dataset (c2i)
     workers: int = 0                    # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     lbs: int = 0                        # local batch size; if lbs != 0, bs will be ignored, and will be reset as round(args.lbs / args.ac) * dist.get_world_size()
     bs: int = 0                         # global batch size; if lbs != 0, bs will be ignored
@@ -135,6 +139,10 @@ class Args(Tap):
     tlen: int = 512                     # truncate text embedding to this length
     Ct5: int = 2048                     # feature dimension of text encoder
     use_bit_label: int = 1              # pred bitwise labels or index-wise labels
+    use_dit_label: int = 0              # use *d*-it labels or not
+    use_cce: int = 0                    # use cce loss
+    cce_impl: str = "cce_exact"         # implementations for cce loss
+    zloss_weight: float = 0.0           # weight for z-loss
     bitloss_type: str = 'mean'          # mean or sum
     dynamic_resolution_across_gpus: int = 1 # allow dynamic resolution across gpus
     enable_dynamic_length_prompt: int = 0 # enable dynamic length prompt during training
@@ -147,10 +155,14 @@ class Args(Tap):
     rope2d_each_sa_layer: int = 0       # apply rope2d to each self-attention layer
     rope2d_normalized_by_hw: int = 1    # apply normalized rope2d
     use_fsdp_model_ema: int = 0         # use fsdp model ema
+    schedule_mode: str = "dynamic"      # use dynamic or original schedule (1,2,3,4,5,6,8,10,13,16 as in VAR)
     add_lvl_embeding_only_first_block: int = 1 # apply lvl pe embedding only first block or each block
     reweight_loss_by_scale: int = 0     # reweight loss by scale
     always_training_scales: int = 100   # trunc training scales
     vae_type: int = 1                   # here 16/32/64 is bsq vae of different quant bits
+    quantizer_type: str = 'MultiScaleBSQ' # quantizer type, MultiScaleBSQ or MultiScaleLeechQ
+    leech_type: str = "full"            # leech lattice type, "full" or "2" | "3" | "4"
+    codebook_size: int = 196_560        # codebook size, only used when quantizer_type is MultiScaleLeechQ
     fake_vae_input: bool = False        # fake vae input for debug
     model_init_device: str = 'cuda'     # model_init_device
     prefetch_factor: int = 2            # prefetch_factor for dataset
